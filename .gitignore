@@ -1,0 +1,7 @@
+.idea/
+node_modules/
+**/.terraform/
+.env
+.env.*
+!.env.example
+*tf_plan*

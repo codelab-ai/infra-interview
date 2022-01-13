@@ -1,0 +1,5 @@
+*.key filter=git-crypt diff=git-crypt
+*.secret filter=git-crypt diff=git-crypt
+*.pem filter=git-crypt diff=git-crypt
+secrets.tf filter=git-crypt diff=git-crypt
+*secrets*.tf filter=git-crypt diff=git-crypt

@@ -1,0 +1,442 @@
+filters-master: &filters-master
+  filters:
+    branches:
+      only:
+        - master
+
+filters-pr: &filters-pr
+  filters:
+    branches:
+      ignore:
+        - master
+
+executor-params: &executor-params
+  parameters:
+    e:
+      type: executor
+      default: docker-ubuntu
+  executor: << parameters.e >>
+
+executor-config: &executor-config
+  environment:
+    # CircleCI
+    GITHUB_CUONG: 23kbps
+    SLACK_CUONG: <@U02DHM79UB1>
+    GITHUB_WEBBER: webberwang
+    SLACK_WEBBER: <@U0J401GAH>
+    SLACK_CHANNEL_UPDATE: CQVPNKS8K
+    COLOR_SUCCESS: "#b7eb8f"
+    COLOR_FAILURE: "#ffccc7"
+  working_directory: ~/project
+
+version: 2.1
+
+orbs:
+  slack: circleci/slack@4.4.2
+  aws-cli: circleci/aws-cli@2.0.3
+
+executors:
+  docker-ubuntu:
+    <<: *executor-config
+    docker:
+      - image: cimg/base:2021.10
+    resource_class: small
+
+commands:
+  pr_comment:
+    parameters:
+      tfplan_file:
+        description: The tfplan output file abs path
+        type: string
+      env:
+        description: Environment to check tf plan
+        type: string
+    steps:
+      - run:
+          command: |
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt update && sudo apt-get install gh -y
+          name: Install gh cli
+      - run:
+          command: |
+            if [[ -z "${GITHUB_TOKEN}" ]]; then
+              echo "GITHUB_TOKEN not set"
+              /bin/false
+            fi
+          name: Check Token
+      - run:
+          command: |
+            if [ -z "${CIRCLE_PULL_REQUEST##*/}" ]; then
+              echo "Not a PR"
+            else
+              TFPLAN_FILE=<< parameters.tfplan_file>>
+              ENV=<< parameters.env>>
+              SHORT_SHA1=$(echo $CIRCLE_SHA1 | cut -c -7)
+              echo "Start commenting to PR"
+              echo "Terraform plan for environment $ENV in commit $SHORT_SHA1" > /tmp/tfplan.out
+              echo '```' >> /tmp/tfplan.out
+              cat $TFPLAN_FILE >> /tmp/tfplan.out
+              echo '```' >> /tmp/tfplan.out
+              gh pr comment $CIRCLE_PULL_REQUEST -F /tmp/tfplan.out
+            fi
+          name: Send Comment
+
+  setup-workspace:
+    parameters:
+      attach_workspace:
+        default: true
+        type: boolean
+    description: "Setup workspace"
+    steps:
+      - checkout
+      - when:
+          condition: << parameters.attach_workspace >>
+          steps:
+            - attach_workspace:
+                at: .
+      - run:
+          name: "Install jq, curl, git-crypt, gnupg"
+          command: |
+            cd /tmp/
+            sudo apt-get update
+            sudo apt-get install -y curl jq git-crypt gnupg wget unzip
+            sudo rm -rf awscli*.zip
+            sudo rm -rf terraform*.zip
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && unzip -o awscliv2.zip && sudo ./aws/install
+            curl "https://releases.hashicorp.com/terraform/1.0.6/terraform_1.0.6_linux_amd64.zip" -o "terraform.zip" && unzip -o terraform.zip  && chmod +x terraform && sudo mv terraform /usr/local/bin/
+            echo "Test tools"
+            aws --version
+            terraform version
+      - run:
+          name: "Setup env"
+          command: |
+            # slack settings
+            if [ $CIRCLE_USERNAME == $GITHUB_CUONG ]; then
+              echo 'export SLACK_PARAM_MENTIONS=${SLACK_CUONG}' >> $BASH_ENV
+            else
+              echo 'export SLACK_PARAM_MENTIONS=${SLACK_WEBBER}' >> $BASH_ENV
+            fi
+
+            # finally import bash env
+            source $BASH_ENV
+
+  setup-aws-credentials:
+    steps:
+      - run:
+          name: import env vars
+          command: |
+            source ./.vars.secret
+
+  setup-git-crypt:
+    steps:
+      - run:
+          name: import gpg key
+          command: |
+            echo $CI_GPG_PRIVATE_KEY | base64 -d > /tmp/private.key
+            gpg --import /tmp/private.key
+      - run:
+          name: unlock git-crypt
+          command: |
+            git status
+            git checkout .
+            git-crypt unlock
+
+  terraform-plan-staging:
+    steps:
+      - aws-cli/setup
+      - run:
+          name: terraform init & validate & plan
+          command: |
+            source ./.vars.secret
+            cd terraform/environments/staging
+            terraform init -input=false
+            terraform validate
+            tfstate=$(terraform output | grep "No outputs found" 1>/dev/null && echo "Empty" || echo "Existing")
+            export TFPLAN_FILE=infra_tf_plan.out
+            echo "export TFPLAN_FILE=infra_tf_plan.out" >> $BASH_ENV
+            if [ "$tfstate" = "Empty" ]; then
+              echo "Terraform state is empty. Provisioning new infra"
+              terraform plan -no-color  > $TFPLAN_FILE 2>&1
+              terraform plan -out infra_tf_plan_staging
+            else
+              ECS_CLUSTER_ARN=$(terraform output -raw ecs_cluster_arn)
+              ECS_APP_SERVICE_NAME=$(terraform output -raw ecs_app_service_name)
+              ECS_APP_TASK_DEFINITION=$(aws ecs describe-services --services $ECS_APP_SERVICE_NAME --cluster $ECS_CLUSTER_ARN | jq  -r '.services[0].taskDefinition')
+              ECS_APP_IMAGE_TAG=$(aws ecs describe-task-definition --task-definition $ECS_APP_TASK_DEFINITION| jq -r '.taskDefinition.containerDefinitions[0].image' | awk -F':' '{print $2}')
+              echo "ECS_CLUSTER_ARN - $ECS_CLUSTER_ARN"
+              echo "ECS_APP_SERVICE_NAME - $ECS_APP_SERVICE_NAME"
+              echo "ECS_APP_IMAGE_TAG - $ECS_APP_IMAGE_TAG"
+              terraform plan -var "app_image_tag=$ECS_APP_IMAGE_TAG" -no-color > $TFPLAN_FILE 2>&1
+              terraform plan -var "app_image_tag=$ECS_APP_IMAGE_TAG" -out infra_tf_plan_staging
+            fi
+      - pr_comment:
+          tfplan_file: terraform/environments/staging/infra_tf_plan.out
+          env: "staging"
+
+  terraform-apply-staging:
+    steps:
+      - aws-cli/setup
+      - run:
+          name: "Terraform apply staging"
+          command: |
+            source ./.vars.secret
+            cd terraform/environments/staging
+            terraform init -input=false
+            terraform apply --auto-approve infra_tf_plan_staging
+
+  terraform-plan-prod:
+    steps:
+      - aws-cli/setup
+      - run:
+          name: terraform init & validate & plan
+          command: |
+            source ./.vars.secret
+            cd terraform/environments/prod
+            terraform init -input=false
+            terraform validate
+            tfstate=$(terraform output | grep "No outputs found" 1>/dev/null && echo "Empty" || echo "Existing")
+            export TFPLAN_FILE=infra_tf_plan.out
+            echo "export TFPLAN_FILE=infra_tf_plan.out" >> $BASH_ENV
+            if [ "$tfstate" = "Empty" ]; then
+              echo "Terraform state is empty. Provisioning new infra"
+              terraform plan -no-color  > $TFPLAN_FILE 2>&1
+              terraform plan -out infra_tf_plan_prod
+            else
+              ECS_CLUSTER_ARN=$(terraform output -raw ecs_cluster_arn)
+              ECS_APP_SERVICE_NAME=$(terraform output -raw ecs_app_service_name)
+              ECS_APP_TASK_DEFINITION=$(aws ecs describe-services --services $ECS_APP_SERVICE_NAME --cluster $ECS_CLUSTER_ARN | jq  -r '.services[0].taskDefinition')
+              ECS_APP_IMAGE_TAG=$(aws ecs describe-task-definition --task-definition $ECS_APP_TASK_DEFINITION| jq -r '.taskDefinition.containerDefinitions[0].image' | awk -F':' '{print $2}')
+              echo "ECS_CLUSTER_ARN - $ECS_CLUSTER_ARN"
+              echo "ECS_APP_SERVICE_NAME - $ECS_APP_SERVICE_NAME"
+              echo "ECS_APP_IMAGE_TAG - $ECS_APP_IMAGE_TAG"
+              terraform plan -var "app_image_tag=$ECS_APP_IMAGE_TAG" -no-color > $TFPLAN_FILE 2>&1
+              terraform plan -var "app_image_tag=$ECS_APP_IMAGE_TAG" -out infra_tf_plan_prod
+            fi
+      - pr_comment:
+          tfplan_file: terraform/environments/prod/infra_tf_plan.out
+          env: "prod"
+
+  terraform-apply-prod:
+    steps:
+      - aws-cli/setup
+      - run:
+          name: "Terraform apply prod"
+          command: |
+            source ./.vars.secret
+            cd terraform/environments/prod
+            terraform init -input=false
+            terraform apply --auto-approve infra_tf_plan_prod
+
+  notify-failure:
+    steps:
+      - slack/notify:
+          event: fail
+          channel: $SLACK_CHANNEL_UPDATE
+          template: basic_fail_1
+
+jobs:
+  infra-plan-staging-pr:
+    <<: *executor-params
+    description: "Plan for infra staging and add to PR"
+    steps:
+      - setup-workspace
+      - setup-git-crypt
+      - setup-aws-credentials
+      - terraform-plan-staging
+
+  infra-plan-prod-pr:
+    <<: *executor-params
+    description: "Plan for infra staging and add to PR"
+    steps:
+      - setup-workspace
+      - setup-git-crypt
+      - setup-aws-credentials
+      - terraform-plan-prod
+
+  infra-plan-staging:
+    <<: *executor-params
+    description: "Plan for infra staging"
+    steps:
+      - setup-workspace
+      - setup-git-crypt
+      - setup-aws-credentials
+      - terraform-plan-staging
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+      - notify-failure
+
+  infra-apply-staging:
+    <<: *executor-params
+    description: "Apply for infra staging"
+    steps:
+      - setup-workspace
+      - setup-git-crypt
+      - setup-aws-credentials
+      - terraform-apply-staging
+      - notify-failure
+
+  infra-plan-prod:
+    <<: *executor-params
+    description: "Plan for infra Prod"
+    steps:
+      - setup-workspace
+      - setup-git-crypt
+      - setup-aws-credentials
+      - terraform-plan-prod
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+      - notify-failure
+
+  infra-apply-prod:
+    <<: *executor-params
+    description: "Apply for infra prod"
+    steps:
+      - setup-workspace
+      - setup-git-crypt
+      - setup-aws-credentials
+      - terraform-apply-prod
+      - notify-failure
+
+  notify-success:
+    <<: *executor-params
+    steps:
+      - setup-workspace
+      - slack/notify:
+          event: pass
+          channel: $SLACK_CHANNEL_UPDATE
+          custom: |
+            {
+            	"text": "CircleCI job succeeded!",
+            	"blocks": [
+            		{
+            			"type": "header",
+            			"text": {
+            				"type": "plain_text",
+            				"text": "Job Succeeded. :white_check_mark:",
+            				"emoji": true
+            			}
+            		},
+            		{
+            			"type": "section",
+            			"fields": [
+            				{
+            					"type": "mrkdwn",
+            					"text": "*Job*: ${CIRCLE_JOB}"
+            				}
+            			]
+            		},
+            		{
+            			"type": "section",
+            			"fields": [
+            				{
+            					"type": "mrkdwn",
+            					"text": "*Project*:\n $CIRCLE_PROJECT_REPONAME"
+            				},
+            				{
+            					"type": "mrkdwn",
+            					"text": "*Branch*:\n $CIRCLE_BRANCH"
+                            },
+                            {
+            					"type": "mrkdwn",
+            					"text": "*Commit*:\n $CIRCLE_SHA1"
+            				},
+            				{
+            					"type": "mrkdwn",
+            					"text": "*Author*:\n $CIRCLE_USERNAME"
+            				}
+            			],
+            			"accessory": {
+            				"type": "image",
+            				"image_url": "https://assets.brandfolder.com/otz5mn-bw4j2w-6jzqo8/original/circle-logo-badge-black.png",
+            				"alt_text": "CircleCI logo"
+            			}
+            		},
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Mentions*:\n $SLACK_PARAM_MENTIONS"
+                    }
+                  ]
+                },
+            		{
+            			"type": "actions",
+            			"elements": [
+            				{
+            					"type": "button",
+            					"text": {
+            						"type": "plain_text",
+            						"text": "View Job"
+            					},
+            					"url": "${CIRCLE_BUILD_URL}"
+            				}
+            			]
+            		}
+            	]
+            }
+
+workflows:
+  infra-plan:
+    jobs:
+      - infra-plan-staging-pr:
+          <<: *filters-pr
+          context:
+            - GLOBAL
+      - infra-plan-prod-pr:
+          <<: *filters-pr
+          context:
+            - GLOBAL
+
+  infra-prod:
+    jobs:
+      - infra-plan-prod:
+          <<: *filters-master
+          context:
+            - GLOBAL
+      - infra-hold-apply:
+          <<: *filters-master
+          type: approval
+          requires:
+            - infra-plan-prod
+      - infra-apply-prod:
+          <<: *filters-master
+          context:
+            - GLOBAL
+          requires:
+            - infra-hold-apply
+      - notify-success:
+          <<: *filters-master
+          context:
+            - GLOBAL
+          requires:
+            - infra-apply-prod
+
+  infra-staging:
+    jobs:
+      - infra-plan-staging:
+          <<: *filters-master
+          context:
+            - GLOBAL
+      - infra-hold-apply-staging:
+          <<: *filters-master
+          type: approval
+          requires:
+            - infra-plan-staging
+      - infra-apply-staging:
+          <<: *filters-master
+          context:
+            - GLOBAL
+          requires:
+            - infra-hold-apply-staging
+      - notify-success:
+          <<: *filters-master
+          context:
+            - GLOBAL
+          requires:
+            - infra-apply-staging
